@@ -1,0 +1,409 @@
+{
+  "name": "AI Resume Screening and Candidate Shortlisting",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "resume-upload",
+        "responseMode": "lastNode",
+        "options": {
+          "binaryData": true
+        }
+      },
+      "id": "a2d5d0e8-6f4c-4fd0-8f73-403bb8fd7b84",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        320
+      ],
+      "webhookId": "resume-upload"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "file",
+        "options": {}
+      },
+      "id": "7f48ca3b-8617-49c6-b95f-8799ed855c65",
+      "name": "Extract Text From PDF",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        360,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\n\nconst KNOWN_SKILLS = [\n  'python', 'machine learning', 'sql', 'javascript', 'typescript', 'react',\n  'node.js', 'node', 'mongodb', 'express', 'java', 'c++', 'aws', 'docker',\n  'kubernetes', 'pandas', 'numpy', 'tensorflow', 'pytorch', 'power bi', 'excel'\n];\n\nfunction toTitleCase(text) {\n  return text\n    .toLowerCase()\n    .split(/\\s+/)\n    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))\n    .join(' ');\n}\n\nreturn items.map((item) => {\n  // Extract From PDF may not forward binary; fetch original uploaded binary from Webhook item.\n  const webhookItem = $items('Webhook', 0, 0)[0] || {};\n  const bin = item.binary?.file || webhookItem.binary?.file;\n\n  if (!bin?.data) {\n    throw new Error('Missing PDF file in multipart/form-data. Expected field name file.');\n  }\n\n  const extracted = String(item.json?.text || '').trim();\n  const cleaned = extracted\n    .replace(/\\r\\n/g, '\\n')\n    .replace(/\\t/g, ' ')\n    .replace(/[ ]{2,}/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n\n  if (!cleaned) {\n    throw new Error('Unable to extract readable text from PDF.');\n  }\n\n  const resumeText = cleaned;\n  const emailMatch = resumeText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  const heuristicEmail = emailMatch ? emailMatch[0].toLowerCase() : '';\n\n  let heuristicName = '';\n  const nameLabelMatch = resumeText.match(/(?:^|\\n)\\s*name\\s*[:\\-]\\s*([^\\n]+)/i);\n  if (nameLabelMatch?.[1]) {\n    heuristicName = nameLabelMatch[1].trim();\n  } else {\n    const firstLine = resumeText.split('\\n').map((l) => l.trim()).find(Boolean) || '';\n    if (/^[A-Za-z][A-Za-z .'-]{2,}$/.test(firstLine) && !/@/.test(firstLine)) {\n      heuristicName = firstLine;\n    }\n  }\n\n  const lower = resumeText.toLowerCase();\n  const heuristicSkills = KNOWN_SKILLS\n    .filter((s) => lower.includes(s))\n    .map((s) => toTitleCase(s));\n\n  item.json = {\n    ...item.json,\n    fileName: bin.fileName || 'resume.pdf',\n    mimeType: bin.mimeType || 'application/pdf',\n    resumeText,\n    heuristicName: heuristicName || 'Unknown',\n    heuristicEmail: heuristicEmail || 'unknown@example.com',\n    heuristicSkills: [...new Set(heuristicSkills)]\n  };\n\n  item.binary = {\n    ...(item.binary || {}),\n    file: bin\n  };\n\n  return item;\n});"
+      },
+      "id": "9b95d6b5-321e-41eb-8947-8ac4ed0307d9",
+      "name": "Extract and Clean Resume Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'llama3.2:1b',\n  stream: false,\n  format: 'json',\n  prompt: 'Extract the following details from this resume text:\\n- Name\\n- Email\\n- Skills (array)\\n- Experience (number)\\n- Education\\n\\nReturn STRICT JSON only with this structure:\\n{\\n  \"name\": \"\",\\n  \"email\": \"\",\\n  \"skills\": [],\\n  \"experience\": 0,\\n  \"education\": \"\"\\n}\\n\\nResume Text:\\n' + $json.resumeText\n} }}",
+        "options": {}
+      },
+      "id": "cf8aa6e3-11be-4324-8317-f8535ec306d6",
+      "name": "Gemini Parse Resume",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const raw = $json?.response || '';\nconst cleaned = String(raw)\n  .replace(/```json/gi, '')\n  .replace(/```/g, '')\n  .trim();\n\nlet parsed = {};\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  const start = cleaned.indexOf('{');\n  const end = cleaned.lastIndexOf('}');\n  if (start !== -1 && end !== -1 && end > start) {\n    parsed = JSON.parse(cleaned.slice(start, end + 1));\n  }\n}\n\nconst baseItem = $items('Extract and Clean Resume Text', 0, 0)[0] || {};\nconst base = baseItem.json || {};\nconst fileBinary = baseItem.binary?.file ? { file: baseItem.binary.file } : undefined;\n\nconst finalName = String(parsed.name || '').trim() || base.heuristicName || 'Unknown';\nconst finalEmail = String(parsed.email || '').trim().toLowerCase() || base.heuristicEmail || 'unknown@example.com';\nconst finalSkills = Array.isArray(parsed.skills) && parsed.skills.length\n  ? parsed.skills.map((s) => String(s).trim()).filter(Boolean)\n  : (Array.isArray(base.heuristicSkills) ? base.heuristicSkills : []);\n\nreturn [\n  {\n    json: {\n      name: finalName,\n      email: finalEmail,\n      skills: finalSkills,\n      experience: Number(parsed.experience) || 0,\n      education: parsed.education || ''\n    },\n    binary: fileBinary\n  }\n];"
+      },
+      "id": "6069f175-3088-4436-a060-97885452ba55",
+      "name": "Clean Parse JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  model: 'llama3.2:1b',\n  stream: false,\n  format: 'json',\n  prompt: 'Job Description: Python, Machine Learning, SQL, 2+ years experience\\n\\nCandidate Profile:\\n' + JSON.stringify({\n    name: $json.name,\n    email: $json.email,\n    skills: $json.skills,\n    experience: $json.experience,\n    education: $json.education\n  }) + '\\n\\nReturn STRICT JSON only with this structure:\\n{\\n  \"score\": 0,\\n  \"decision\": \"Shortlist\",\\n  \"missing_skills\": [],\\n  \"strengths\": []\\n}'\n} }}",
+        "options": {}
+      },
+      "id": "235f09f8-4790-4655-a042-fd72484be972",
+      "name": "Gemini Score Candidate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1180,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "e44886c0-3d91-4ec6-81c0-87f32da8dc21",
+      "name": "Merge Inputs",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1420,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const inputItem = $input.first() || {};\nconst rawScore = $json?.response || '';\nconst cleanedScore = String(rawScore)\n  .replace(/```json/gi, '')\n  .replace(/```/g, '')\n  .trim();\n\nlet scoreObj = {};\ntry {\n  scoreObj = JSON.parse(cleanedScore);\n} catch (e) {\n  const start = cleanedScore.indexOf('{');\n  const end = cleanedScore.lastIndexOf('}');\n  if (start !== -1 && end !== -1 && end > start) {\n    scoreObj = JSON.parse(cleanedScore.slice(start, end + 1));\n  }\n}\n\nconst candidateName = String($json.name || '').trim() || 'Unknown Candidate';\nconst candidateEmail = $json.email || '';\nconst candidateSkills = Array.isArray($json.skills) ? $json.skills : [];\nconst experience = Number($json.experience) || 0;\nconst education = $json.education || '';\n\nconst mustHaveSkills = ['python', 'machine learning', 'sql'];\nconst normalizedSkills = candidateSkills.map((s) => String(s).toLowerCase().trim());\nconst matchedMustHaveSkills = mustHaveSkills.filter((s) => normalizedSkills.some((x) => x.includes(s)));\nconst missingMustHaveSkills = mustHaveSkills.filter((s) => !matchedMustHaveSkills.includes(s));\n\nconst hasMinimumExperience = experience >= 2;\nconst modelScore = Math.max(0, Math.min(100, Number(scoreObj.score) || 0));\n\nconst skillScore = Math.round((matchedMustHaveSkills.length / mustHaveSkills.length) * 60);\nconst experienceScore = hasMinimumExperience ? 20 : Math.max(0, Math.round((experience / 2) * 20));\nconst finalScore = Math.max(0, Math.min(100, Math.round(skillScore + experienceScore + (modelScore * 0.2))));\n\nconst shortlisted = matchedMustHaveSkills.length >= 2 && hasMinimumExperience && finalScore >= 70;\nconst status = shortlisted ? 'Shortlisted' : 'Rejected';\nconst fileBinary = inputItem.binary?.file ? { file: inputItem.binary.file } : undefined;\n\nconst modelMissingSkills = Array.isArray(scoreObj.missing_skills) ? scoreObj.missing_skills : [];\nconst combinedMissingSkills = [...new Set([...missingMustHaveSkills, ...modelMissingSkills.map((s) => String(s).toLowerCase())])];\n\nreturn [\n  {\n    json: {\n      name: candidateName,\n      email: candidateEmail,\n      skills: candidateSkills,\n      experience,\n      education,\n      score: finalScore,\n      decision: shortlisted ? 'Shortlist' : 'Reject',\n      missing_skills: combinedMissingSkills,\n      strengths: Array.isArray(scoreObj.strengths) ? scoreObj.strengths : [],\n      status\n    },\n    binary: fileBinary\n  }\n];"
+      },
+      "id": "0197a156-f7f6-4064-a700-9d337d6493f3",
+      "name": "Merge Data Node",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.status}}",
+              "operation": "equal",
+              "value2": "Shortlisted"
+            }
+          ]
+        }
+      },
+      "id": "b0302f3e-a3d6-4f6f-a334-4f4f7497f0d6",
+      "name": "IF Score > 70",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1860,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://script.google.com/macros/s/AKfycbz7fy-E1vzit1CM2CfK2-nUehPBf22Jx2IssVp_FE6gjc3p2Yx_wNAXtt9tzlm1u2E/exec",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  name: $json.name || '',\n  email: $json.email || '',\n  skills: Array.isArray($json.skills) ? $json.skills : [],\n  experience: Number($json.experience) || 0,\n  score: Number($json.score) || 0,\n  status: $json.status || ''\n} }}",
+        "options": {}
+      },
+      "id": "44f5f5a3-c53c-49cb-a1c7-94c5fdd0ea69",
+      "name": "Google Sheets Append",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2090,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://script.google.com/macros/s/AKfycbz7fy-E1vzit1CM2CfK2-nUehPBf22Jx2IssVp_FE6gjc3p2Yx_wNAXtt9tzlm1u2E/exec",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  name: $json.name || '',\n  email: $json.email || '',\n  skills: Array.isArray($json.skills) ? $json.skills : [],\n  experience: Number($json.experience) || 0,\n  score: Number($json.score) || 0,\n  status: 'Rejected',\n  decision: $json.decision || 'Reject',\n  missing_skills: Array.isArray($json.missing_skills) ? $json.missing_skills : []\n} }}",
+        "options": {}
+      },
+      "id": "f7d0c8d1-28b4-47d4-bf57-9c1695f12043",
+      "name": "Google Sheets Append Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2090,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "titusjerwin@gmail.com",
+        "toEmail": "titusjerwin@gmail.com",
+        "subject": "=Shortlisted Candidate - {{$json.name || 'Unknown Candidate'}}",
+        "text": "=Shortlisted Candidate\\n\\nName: {{$json.name || 'Unknown Candidate'}}\\nEmail: {{$json.email || ''}}\\nSkills: {{Array.isArray($json.skills) ? $json.skills.join(', ') : ''}}\\nExperience: {{$json.experience || 0}} years\\nScore: {{$json.score || 0}}\\nStatus: {{$json.status || ''}}\\n\\nSelected resume is attached.",
+        "options": {
+          "attachments": "file"
+        }
+      },
+      "id": "8d09846e-d1bc-4688-a6ac-dfb4f31f4caa",
+      "name": "SMTP Notify",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2320,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base = ($items('Merge Data Node', 0, 0)[0] || {}).json || {};\nconst smtpAccepted = Array.isArray($json?.accepted) ? $json.accepted : [];\n\nreturn [\n  {\n    json: {\n      name: base.name || 'Unknown',\n      email: base.email || '',\n      skills: Array.isArray(base.skills) ? base.skills : [],\n      experience: Number(base.experience) || 0,\n      education: base.education || '',\n      score: Number(base.score) || 0,\n      decision: base.decision || '',\n      missing_skills: Array.isArray(base.missing_skills) ? base.missing_skills : [],\n      strengths: Array.isArray(base.strengths) ? base.strengths : [],\n      status: base.status || '',\n      accepted: smtpAccepted\n    }\n  }\n];"
+      },
+      "id": "a536254f-d640-4acf-84c1-5a92b7c1496a",
+      "name": "Prepare Webhook Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2550,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Text From PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text From PDF": {
+      "main": [
+        [
+          {
+            "node": "Extract and Clean Resume Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract and Clean Resume Text": {
+      "main": [
+        [
+          {
+            "node": "Gemini Parse Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Parse Resume": {
+      "main": [
+        [
+          {
+            "node": "Clean Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Gemini Score Candidate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Score Candidate": {
+      "main": [
+        [
+          {
+            "node": "Merge Inputs",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Inputs": {
+      "main": [
+        [
+          {
+            "node": "Merge Data Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Data Node": {
+      "main": [
+        [
+          {
+            "node": "IF Score > 70",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Score > 70": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets Append",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SMTP Notify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets Append Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets Append": {
+      "main": [
+        []
+      ]
+    },
+    "Google Sheets Append Rejected": {
+      "main": [
+        [
+          {
+            "node": "Prepare Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SMTP Notify": {
+      "main": [
+        [
+          {
+            "node": "Prepare Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "versionId": "28d61c90-4ef8-4269-8575-ab9ad9cc75cc",
+  "meta": {
+    "instanceId": "resume-screening-workflow"
+  }
+}
